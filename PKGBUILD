@@ -1,7 +1,7 @@
 # Maintainer: slitte <slitte@users.noreply.github.com>
 pkgname=xfce-theme-switch
-pkgver=1.0.0
-pkgrel=2
+pkgver=1.0.1
+pkgrel=1
 pkgdesc="Automatic dark/light theme switcher for XFCE based on sun position, with system tray"
 arch=('any')
 url="https://github.com/slitte/xfce-theme-switch"
@@ -21,7 +21,7 @@ optdepends=(
     'qt6ct: Qt6 theme support'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('035c40c764a10e600e3659f1e0b9f8cfc361cd909deee2f3ecae4a772f84bb47')
+sha256sums=('SKIP')
 
 package() {
     cd "$srcdir/$pkgname-$pkgver"
