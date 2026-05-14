@@ -20,7 +20,7 @@ optdepends=(
     'qt6ct: Qt6 theme support'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('035c40c764a10e600e3659f1e0b9f8cfc361cd909deee2f3ecae4a772f84bb47')
 
 package() {
     cd "$srcdir/$pkgname-$pkgver"
