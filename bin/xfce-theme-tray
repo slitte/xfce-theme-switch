@@ -408,6 +408,8 @@ class ThemeTray:
         self._inhibit = False
         self._pending_apply: int | None = None
         self._items: dict[str, Gtk.RadioMenuItem] = {}
+        # Track last applied state so _refresh skips redundant D-Bus/menu updates.
+        self._applied_state: str = ""
 
         self._indicator.set_menu(self._build_menu())
         self._refresh()
@@ -441,6 +443,9 @@ class ThemeTray:
 
     def _refresh(self) -> bool:
         state = read_state()
+        if state == self._applied_state:
+            return GLib.SOURCE_CONTINUE
+        self._applied_state = state
         self._indicator.set_icon_full(
             _ICON.get(state, _ICON["auto"]),
             _LABEL.get(state, state),
@@ -452,11 +457,15 @@ class ThemeTray:
             self._inhibit = False
         return GLib.SOURCE_CONTINUE
 
+    def _refresh_once(self) -> bool:
+        self._refresh()
+        return GLib.SOURCE_REMOVE
+
     def _on_mode_toggled(self, item: Gtk.RadioMenuItem, mode: str) -> None:
         if self._inhibit or not item.get_active():
             return
         write_state(mode)
-        GLib.idle_add(self._refresh)
+        GLib.idle_add(self._refresh_once)
         if self._pending_apply is not None:
             GLib.source_remove(self._pending_apply)
         self._pending_apply = GLib.timeout_add(250, self._commit_apply, mode)
