@@ -2,7 +2,7 @@
 """
 xfce-theme-tray — System-Tray-Daemon für xfce-theme-switch.
 
-Abhängigkeiten: python-gobject (Arch: python-gobject)
+Abhängigkeiten: python-gobject, libappindicator3
 """
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ from pathlib import Path
 from threading import Thread
 
 import gi
+gi.require_version("AppIndicator3", "0.1")
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk  # noqa: E402  (must follow gi.require_version)
+from gi.repository import AppIndicator3, GLib, Gtk  # noqa: E402  (must follow gi.require_version)
 
 
 # ---------------------------------------------------------------------------
@@ -390,46 +391,69 @@ class SettingsDialog(Gtk.Dialog):
 
 
 # ---------------------------------------------------------------------------
-# Tray
+# Tray  (AppIndicator3 — replaces deprecated Gtk.StatusIcon to avoid busy-wait)
 # ---------------------------------------------------------------------------
 
 class ThemeTray:
     def __init__(self) -> None:
-        self._icon = Gtk.StatusIcon()
-        self._icon.set_visible(True)
-        self._icon.connect("activate",   self._on_activate)   # left click  → quick menu
-        self._icon.connect("popup-menu", self._on_popup)      # right click → settings
+        self._indicator = AppIndicator3.Indicator.new(
+            "xfce-theme-tray",
+            _ICON["auto"],
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self._indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+
+        # Guard flag: prevents _on_mode_toggled from firing during programmatic
+        # radio-item updates inside _refresh().
+        self._inhibit = False
         self._pending_apply: int | None = None
+        self._items: dict[str, Gtk.RadioMenuItem] = {}
+
+        self._indicator.set_menu(self._build_menu())
         self._refresh()
         GLib.timeout_add_seconds(60, self._refresh)
 
-    def _refresh(self) -> bool:
-        state = read_state()
-        self._icon.set_from_icon_name(_ICON.get(state, _ICON["auto"]))
-        self._icon.set_tooltip_text(f"XFCE Theme Switch — {_LABEL.get(state, state)}")
-        return GLib.SOURCE_CONTINUE
+    def _build_menu(self) -> Gtk.Menu:
+        menu = Gtk.Menu()
 
-    def _on_activate(self, icon: Gtk.StatusIcon) -> None:
-        state = read_state()
-        menu  = Gtk.Menu()
         group: list[Gtk.RadioMenuItem] = []
-
         for label, mode in (("Automatik", "auto"), ("Hell", "light"), ("Dunkel", "dark")):
             item = Gtk.RadioMenuItem.new_with_label(group, label)
             group = item.get_group()
-            item.set_active(state == mode)
+            self._items[mode] = item
             item.connect("toggled", self._on_mode_toggled, mode)
             menu.append(item)
 
-        menu.show_all()
-        menu.popup(None, None, Gtk.StatusIcon.position_menu,
-                   icon, 0, Gtk.get_current_event_time())
+        menu.append(Gtk.SeparatorMenuItem())
 
-    def _on_popup(self, _icon: Gtk.StatusIcon, _button: int, _time: int) -> None:
-        self._open_settings()
+        settings_item = Gtk.MenuItem(label="Einstellungen…")
+        settings_item.connect("activate", lambda _: self._open_settings())
+        menu.append(settings_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem(label="Beenden")
+        quit_item.connect("activate", lambda _: Gtk.main_quit())
+        menu.append(quit_item)
+
+        menu.show_all()
+        return menu
+
+    def _refresh(self) -> bool:
+        state = read_state()
+        self._indicator.set_icon_full(
+            _ICON.get(state, _ICON["auto"]),
+            _LABEL.get(state, state),
+        )
+        item = self._items.get(state)
+        if item and not item.get_active():
+            self._inhibit = True
+            item.set_active(True)
+            self._inhibit = False
+        return GLib.SOURCE_CONTINUE
 
     def _on_mode_toggled(self, item: Gtk.RadioMenuItem, mode: str) -> None:
-        if not item.get_active():
+        if self._inhibit or not item.get_active():
             return
         write_state(mode)
         GLib.idle_add(self._refresh)

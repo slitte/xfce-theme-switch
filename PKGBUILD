@@ -1,7 +1,7 @@
 # Maintainer: slitte <slitte@users.noreply.github.com>
 pkgname=xfce-theme-switch
 pkgver=1.0.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Automatic dark/light theme switcher for XFCE based on sun position, with system tray"
 arch=('any')
 url="https://github.com/slitte/xfce-theme-switch"
@@ -9,6 +9,7 @@ license=('MPL-2.0')
 depends=(
     'python>=3.9'
     'python-gobject'
+    'libappindicator3'
     'xfce4-settings'
     'glib2'
     'procps-ng'

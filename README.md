@@ -6,7 +6,7 @@ Automatic dark/light theme switcher for XFCE based on sun position, with a GTK3 
 
 - Switches between dark and light theme automatically at sunrise and sunset
 - Sun position calculated locally — no internet required for the switch itself
-- System tray with left-click quick menu (Auto / Light / Dark) and right-click settings window
+- System tray with mode menu (Auto / Light / Dark) and settings window via AppIndicator3
 - Settings dialog with city search (OpenStreetMap Nominatim) for easy coordinate setup
 - Configures GTK3, GTK4, xfwm4, XFCE panel, gsettings, Qt5ct, Qt6ct and VSCode simultaneously
 - Manual override persists across timer runs until explicitly reset to Auto
@@ -16,7 +16,8 @@ Automatic dark/light theme switcher for XFCE based on sun position, with a GTK3 
 ## Requirements
 
 - Python ≥ 3.9
-- `python-gobject` — GTK3 bindings for the tray
+- `python-gobject` — GTK3 bindings
+- `libappindicator3` — StatusNotifierItem tray (replaces deprecated Gtk.StatusIcon)
 - `xfce4-settings` — provides `xfconf-query` and `xfsettingsd`
 - `glib2` — provides `gsettings`
 - `procps-ng` — provides `pkill`, `pgrep`
@@ -117,8 +118,7 @@ xfce-theme-switch --skip-checks    # skip dependency/theme validation (faster fo
 
 | Action | Result |
 |---|---|
-| Left click | Quick menu: Auto / Light / Dark |
-| Right click | Settings window |
+| Click icon | Menu: Auto / Light / Dark / Settings / Quit |
 | Auto | Follows sunrise/sunset automatically |
 | Light / Dark | Override — stays until you select Auto again |
 
