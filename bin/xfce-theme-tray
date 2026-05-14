@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""
+xfce-theme-tray — System-Tray-Daemon für xfce-theme-switch.
+
+Abhängigkeiten: python-gobject (Arch: python-gobject)
+"""
+
+from __future__ import annotations
+
+import configparser
+import json
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from threading import Thread
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk  # noqa: E402  (must follow gi.require_version)
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR  = Path.home() / ".config" / "xfce-theme-switch"
+CONFIG_FILE = CONFIG_DIR / "config"
+STATE_FILE  = CONFIG_DIR / "state"
+
+# Resolve at runtime: works for both local (~/.local/bin) and system (/usr/bin) installs
+_switch_path = shutil.which("xfce-theme-switch")
+SWITCH_BIN   = Path(_switch_path) if _switch_path else Path("/usr/bin/xfce-theme-switch")
+
+GTK_THEME_DIRS: list[Path] = [
+    Path("/usr/share/themes"),
+    Path.home() / ".local/share/themes",
+    Path.home() / ".themes",
+]
+ICON_THEME_DIRS: list[Path] = [
+    Path("/usr/share/icons"),
+    Path.home() / ".local/share/icons",
+    Path.home() / ".icons",
+]
+
+# Distinct icon for auto-mode so it's visually separate from forced-light
+_ICON: dict[str, str] = {
+    "auto":  "view-refresh",
+    "light": "weather-clear",
+    "dark":  "weather-clear-night",
+}
+_LABEL: dict[str, str] = {
+    "auto":  "Automatik (Sonnenstand)",
+    "light": "Hell (erzwungen)",
+    "dark":  "Dunkel (erzwungen)",
+}
+
+_CONFIG_TEMPLATE = """\
+# xfce-theme-switch configuration
+# All keys are required unless marked optional.
+
+[location]
+# Geographic coordinates for sunrise/sunset calculation.
+# Find yours at: https://www.latlong.net/
+lat = {lat}
+lon = {lon}
+
+[dark]
+gtk_theme  = {dark_gtk}
+icon_theme = {dark_ico}
+wm_theme   = {dark_wm}
+qt_style   = {dark_qt}
+
+[light]
+gtk_theme  = {light_gtk}
+icon_theme = {light_ico}
+wm_theme   = {light_wm}
+qt_style   = {light_qt}
+"""
+
+
+# ---------------------------------------------------------------------------
+# File helpers
+# ---------------------------------------------------------------------------
+
+def _write_atomic(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(content)
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
+
+def read_state() -> str:
+    if not STATE_FILE.exists():
+        return "auto"
+    p = configparser.ConfigParser()
+    p.read(STATE_FILE)
+    mode = p.get("override", "mode", fallback="auto")
+    return mode if mode in ("auto", "dark", "light") else "auto"
+
+
+def write_state(mode: str) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _write_atomic(STATE_FILE, f"[override]\nmode = {mode}\n")
+
+
+def _launch_switch(mode: str) -> None:
+    cmd = [str(SWITCH_BIN), "--skip-checks"]
+    if mode in ("dark", "light"):
+        cmd += ["--force", mode]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        print(f"Warning: could not launch {SWITCH_BIN}: {exc}", file=sys.stderr)
+
+
+def apply_mode(mode: str) -> None:
+    write_state(mode)
+    _launch_switch(mode)
+
+
+# ---------------------------------------------------------------------------
+# Theme discovery
+# ---------------------------------------------------------------------------
+
+def scan_dirs(dirs: list[Path]) -> list[str]:
+    found: set[str] = set()
+    for d in dirs:
+        if d.is_dir():
+            found.update(
+                item.name
+                for item in d.iterdir()
+                if item.is_dir() and not item.name.startswith(".")
+            )
+    return sorted(found, key=str.casefold)
+
+
+# ---------------------------------------------------------------------------
+# Nominatim city search
+# ---------------------------------------------------------------------------
+
+def search_nominatim(query: str) -> list[dict]:
+    params = urllib.parse.urlencode({
+        "q":              query,
+        "format":         "json",
+        "limit":          6,
+        "addressdetails": 1,
+    })
+    url = f"https://nominatim.openstreetmap.org/search?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": "xfce-theme-switch/1.0"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        return json.loads(resp.read())
+
+
+def _format_result(r: dict) -> str:
+    addr  = r.get("address", {})
+    parts = [
+        r.get("name") or addr.get("city") or addr.get("town") or addr.get("village") or "",
+        addr.get("state") or addr.get("county") or "",
+        addr.get("country") or "",
+    ]
+    return ", ".join(p for p in parts if p) or r.get("display_name", "")[:60]
+
+
+# ---------------------------------------------------------------------------
+# Settings dialog
+# ---------------------------------------------------------------------------
+
+class SettingsDialog(Gtk.Dialog):
+    def __init__(self, parent: Gtk.Widget | None = None) -> None:
+        super().__init__(title="Einstellungen — XFCE Theme Switch", transient_for=parent)
+        self.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+        btn_save = self.add_button("Speichern", Gtk.ResponseType.OK)
+        btn_save.get_style_context().add_class("suggested-action")
+        self.set_default_response(Gtk.ResponseType.OK)
+        self.set_default_size(500, -1)
+        self.set_resizable(False)
+
+        box = self.get_content_area()
+        box.set_spacing(18)
+        box.set_margin_top(16)
+        box.set_margin_bottom(16)
+        box.set_margin_start(16)
+        box.set_margin_end(16)
+
+        cfg        = self._load_raw_config()
+        gtk_themes = scan_dirs(GTK_THEME_DIRS)
+        ico_themes = scan_dirs(ICON_THEME_DIRS)
+
+        self._nominatim_results: list[dict] = []
+
+        box.add(self._heading("Standort"))
+        grid_loc = self._grid()
+        self._build_location_rows(grid_loc, cfg)
+        box.add(grid_loc)
+
+        box.add(self._heading("Hell-Theme  (Tagsüber)"))
+        grid_l = self._grid()
+        self._l_gtk  = self._row_combo(grid_l, 0, "GTK-Theme:",   gtk_themes, cfg.get("light", "gtk_theme",  fallback=""))
+        self._l_icon = self._row_combo(grid_l, 1, "Icon-Theme:",  ico_themes, cfg.get("light", "icon_theme", fallback=""))
+        self._l_wm   = self._row_combo(grid_l, 2, "Fensterdeko:", gtk_themes, cfg.get("light", "wm_theme",   fallback=""))
+        self._l_qt   = self._row_entry(grid_l, 3, "Qt-Stil:",                 cfg.get("light", "qt_style",   fallback=""))
+        box.add(grid_l)
+
+        box.add(self._heading("Dunkel-Theme  (Nachts)"))
+        grid_d = self._grid()
+        self._d_gtk  = self._row_combo(grid_d, 0, "GTK-Theme:",   gtk_themes, cfg.get("dark", "gtk_theme",  fallback=""))
+        self._d_icon = self._row_combo(grid_d, 1, "Icon-Theme:",  ico_themes, cfg.get("dark", "icon_theme", fallback=""))
+        self._d_wm   = self._row_combo(grid_d, 2, "Fensterdeko:", gtk_themes, cfg.get("dark", "wm_theme",   fallback=""))
+        self._d_qt   = self._row_entry(grid_d, 3, "Qt-Stil:",                 cfg.get("dark", "qt_style",   fallback=""))
+        box.add(grid_d)
+
+        self.show_all()
+
+    def _build_location_rows(self, grid: Gtk.Grid, cfg: configparser.ConfigParser) -> None:
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._search_entry = Gtk.Entry()
+        self._search_entry.set_placeholder_text("z.B. Bremen, Wien, Zürich…")
+        self._search_entry.set_hexpand(True)
+        self._search_btn = Gtk.Button(label="Suchen")
+        search_box.pack_start(self._search_entry, True,  True,  0)
+        search_box.pack_start(self._search_btn,   False, False, 0)
+        grid.attach(Gtk.Label(label="Stadtsuche:", xalign=0), 0, 0, 1, 1)
+        grid.attach(search_box,                               1, 0, 1, 1)
+
+        self._results_combo  = Gtk.ComboBoxText()
+        self._results_combo.set_hexpand(True)
+        self._results_combo.set_no_show_all(True)
+
+        self._results_status = Gtk.Label(xalign=0)
+        self._results_status.get_style_context().add_class("dim-label")
+        self._results_status.set_no_show_all(True)
+
+        results_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        results_box.pack_start(self._results_combo,  False, False, 0)
+        results_box.pack_start(self._results_status, False, False, 0)
+        grid.attach(Gtk.Label(),  0, 1, 1, 1)
+        grid.attach(results_box,  1, 1, 1, 1)
+
+        self._lat = self._row_entry(grid, 2, "Breitengrad (lat):", cfg.get("location", "lat", fallback=""))
+        self._lon = self._row_entry(grid, 3, "Längengrad  (lon):", cfg.get("location", "lon", fallback=""))
+
+        self._search_btn.connect("clicked",    self._on_search_clicked)
+        self._search_entry.connect("activate", lambda _: self._on_search_clicked(self._search_btn))
+        self._results_combo.connect("changed", self._on_result_selected)
+
+    def _on_search_clicked(self, button: Gtk.Button) -> None:
+        query = self._search_entry.get_text().strip()
+        if not query:
+            return
+        button.set_sensitive(False)
+        button.set_label("Suche…")
+        self._results_combo.set_visible(False)
+        self._results_status.set_visible(False)
+
+        def worker() -> None:
+            try:
+                results: list[dict] | None = search_nominatim(query)
+                error = ""
+            except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+                results = None
+                error   = str(exc)
+            GLib.idle_add(self._on_search_done, results, error, button)
+
+        Thread(target=worker, daemon=True).start()
+
+    def _on_search_done(
+        self,
+        results: list[dict] | None,
+        error:   str,
+        button:  Gtk.Button,
+    ) -> None:
+        button.set_sensitive(True)
+        button.set_label("Suchen")
+
+        if results is None:
+            self._results_status.set_text(f"Fehler: {error}")
+            self._results_status.set_visible(True)
+            return
+
+        self._nominatim_results = results
+
+        if not results:
+            self._results_status.set_text("Keine Ergebnisse gefunden.")
+            self._results_status.set_visible(True)
+            return
+
+        self._results_combo.remove_all()
+        for r in results:
+            self._results_combo.append_text(_format_result(r))
+        self._results_combo.set_visible(True)
+        self._results_combo.show()
+        self._results_combo.set_active(0)
+
+    def _on_result_selected(self, combo: Gtk.ComboBoxText) -> None:
+        idx = combo.get_active()
+        if 0 <= idx < len(self._nominatim_results):
+            r = self._nominatim_results[idx]
+            self._lat.set_text(f"{float(r['lat']):.5f}")
+            self._lon.set_text(f"{float(r['lon']):.5f}")
+
+    @staticmethod
+    def _load_raw_config() -> configparser.ConfigParser:
+        p = configparser.ConfigParser(inline_comment_prefixes=("#",))
+        p.read(CONFIG_FILE)
+        return p
+
+    @staticmethod
+    def _heading(text: str) -> Gtk.Label:
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup(f"<b>{text}</b>")
+        return lbl
+
+    @staticmethod
+    def _grid() -> Gtk.Grid:
+        g = Gtk.Grid()
+        g.set_column_spacing(12)
+        g.set_row_spacing(6)
+        g.set_margin_start(12)
+        return g
+
+    @staticmethod
+    def _row_entry(grid: Gtk.Grid, row: int, label: str, value: str) -> Gtk.Entry:
+        lbl = Gtk.Label(label=label, xalign=0)
+        entry = Gtk.Entry()
+        entry.set_text(value)
+        entry.set_hexpand(True)
+        grid.attach(lbl,   0, row, 1, 1)
+        grid.attach(entry, 1, row, 1, 1)
+        return entry
+
+    @staticmethod
+    def _row_combo(grid: Gtk.Grid, row: int, label: str,
+                   options: list[str], current: str) -> Gtk.ComboBoxText:
+        lbl   = Gtk.Label(label=label, xalign=0)
+        combo = Gtk.ComboBoxText()
+        combo.set_hexpand(True)
+        all_opts = ([current] if current and current not in options else []) + options
+        for opt in all_opts:
+            combo.append_text(opt)
+        combo.set_active(all_opts.index(current) if current in all_opts else 0)
+        grid.attach(lbl,   0, row, 1, 1)
+        grid.attach(combo, 1, row, 1, 1)
+        return combo
+
+    def collect(self) -> dict[str, str]:
+        return {
+            "lat":       self._lat.get_text().strip(),
+            "lon":       self._lon.get_text().strip(),
+            "light_gtk": self._l_gtk.get_active_text()  or "",
+            "light_ico": self._l_icon.get_active_text() or "",
+            "light_wm":  self._l_wm.get_active_text()   or "",
+            "light_qt":  self._l_qt.get_text().strip(),
+            "dark_gtk":  self._d_gtk.get_active_text()  or "",
+            "dark_ico":  self._d_icon.get_active_text() or "",
+            "dark_wm":   self._d_wm.get_active_text()   or "",
+            "dark_qt":   self._d_qt.get_text().strip(),
+        }
+
+    @staticmethod
+    def validate(v: dict[str, str]) -> list[str]:
+        errors: list[str] = []
+        for field, lo, hi in (("lat", -90.0, 90.0), ("lon", -180.0, 180.0)):
+            try:
+                val = float(v[field])
+                if not lo <= val <= hi:
+                    raise ValueError
+            except ValueError:
+                name = "Breitengrad" if field == "lat" else "Längengrad"
+                errors.append(f"{name} '{v[field]}' ungültig  (erwartet {lo}…{hi})")
+        for key in ("light_gtk", "light_ico", "light_wm", "light_qt",
+                    "dark_gtk",  "dark_ico",  "dark_wm",  "dark_qt"):
+            if not v[key]:
+                errors.append(f"Feld '{key}' darf nicht leer sein")
+        return errors
+
+    @staticmethod
+    def save(v: dict[str, str]) -> None:
+        _write_atomic(CONFIG_FILE, _CONFIG_TEMPLATE.format(**v))
+
+
+# ---------------------------------------------------------------------------
+# Tray
+# ---------------------------------------------------------------------------
+
+class ThemeTray:
+    def __init__(self) -> None:
+        self._icon = Gtk.StatusIcon()
+        self._icon.set_visible(True)
+        self._icon.connect("activate",   self._on_activate)   # left click  → quick menu
+        self._icon.connect("popup-menu", self._on_popup)      # right click → settings
+        self._pending_apply: int | None = None
+        self._refresh()
+        GLib.timeout_add_seconds(60, self._refresh)
+
+    def _refresh(self) -> bool:
+        state = read_state()
+        self._icon.set_from_icon_name(_ICON.get(state, _ICON["auto"]))
+        self._icon.set_tooltip_text(f"XFCE Theme Switch — {_LABEL.get(state, state)}")
+        return GLib.SOURCE_CONTINUE
+
+    def _on_activate(self, icon: Gtk.StatusIcon) -> None:
+        state = read_state()
+        menu  = Gtk.Menu()
+        group: list[Gtk.RadioMenuItem] = []
+
+        for label, mode in (("Automatik", "auto"), ("Hell", "light"), ("Dunkel", "dark")):
+            item = Gtk.RadioMenuItem.new_with_label(group, label)
+            group = item.get_group()
+            item.set_active(state == mode)
+            item.connect("toggled", self._on_mode_toggled, mode)
+            menu.append(item)
+
+        menu.show_all()
+        menu.popup(None, None, Gtk.StatusIcon.position_menu,
+                   icon, 0, Gtk.get_current_event_time())
+
+    def _on_popup(self, _icon: Gtk.StatusIcon, _button: int, _time: int) -> None:
+        self._open_settings()
+
+    def _on_mode_toggled(self, item: Gtk.RadioMenuItem, mode: str) -> None:
+        if not item.get_active():
+            return
+        write_state(mode)
+        GLib.idle_add(self._refresh)
+        if self._pending_apply is not None:
+            GLib.source_remove(self._pending_apply)
+        self._pending_apply = GLib.timeout_add(250, self._commit_apply, mode)
+
+    def _commit_apply(self, mode: str) -> bool:
+        _launch_switch(mode)
+        self._pending_apply = None
+        return GLib.SOURCE_REMOVE
+
+    def _open_settings(self) -> None:
+        self._sync_gtk_theme()
+        dialog = SettingsDialog()
+        while True:
+            response = dialog.run()
+            if response != Gtk.ResponseType.OK:
+                break
+            values = dialog.collect()
+            errors = dialog.validate(values)
+            if errors:
+                err = Gtk.MessageDialog(
+                    transient_for=dialog,
+                    message_type=Gtk.MessageType.ERROR,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="Ungültige Eingaben — bitte korrigieren",
+                )
+                err.format_secondary_text("\n".join(errors))
+                err.run()
+                err.destroy()
+                continue
+            dialog.save(values)
+            apply_mode(read_state())
+            break
+        dialog.destroy()
+
+    @staticmethod
+    def _sync_gtk_theme() -> None:
+        """Explicitly sync Gtk.Settings to the current xfconf theme.
+
+        The tray is a long-running process. xfsettingsd broadcasts theme changes
+        via XSETTINGS, but explicitly syncing here ensures the settings dialog
+        always opens with the correct theme applied.
+        """
+        try:
+            result = subprocess.run(
+                ["xfconf-query", "-c", "xsettings", "-p", "/Net/ThemeName"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                Gtk.Settings.get_default().set_property(
+                    "gtk-theme-name", result.stdout.strip()
+                )
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def _fatal(text: str, secondary: str = "") -> None:
+    dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.ERROR,
+                            buttons=Gtk.ButtonsType.OK, text=text)
+    if secondary:
+        dlg.format_secondary_text(secondary)
+    dlg.run()
+    dlg.destroy()
+    sys.exit(1)
+
+
+def main() -> None:
+    if not SWITCH_BIN.exists():
+        _fatal(
+            "xfce-theme-switch nicht gefunden",
+            f"Erwartet unter: {SWITCH_BIN}\n"
+            "Stelle sicher dass xfce-theme-switch installiert und im PATH ist.",
+        )
+    if not CONFIG_FILE.exists():
+        _fatal(
+            "Konfigurationsdatei nicht gefunden",
+            f"Bitte zuerst im Terminal ausführen:\n  xfce-theme-switch\n\n"
+            "Damit wird eine Standard-Konfiguration angelegt.",
+        )
+
+    ThemeTray()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,6 @@
+[Unit]
+Description=XFCE theme switch based on sun position
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/xfce-theme-switch

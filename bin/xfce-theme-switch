@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""
+xfce-theme-switch — Automatic dark/light theme switcher for XFCE based on sun position.
+
+Config: ~/.config/xfce-theme-switch/config
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from math import acos, asin, atan2, cos, degrees, radians, sin
+from pathlib import Path
+from typing import NoReturn, Optional
+
+
+# ---------------------------------------------------------------------------
+# Paths & defaults
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR  = Path.home() / ".config" / "xfce-theme-switch"
+CONFIG_FILE = CONFIG_DIR / "config"
+STATE_FILE  = CONFIG_DIR / "state"
+
+DEFAULT_CONFIG = """\
+# xfce-theme-switch configuration
+# All keys are required unless marked optional.
+
+[location]
+# Geographic coordinates for sunrise/sunset calculation.
+# Find yours at: https://www.latlong.net/
+lat = 53.08
+lon = 8.80
+
+[dark]
+gtk_theme  = Matcha-dark-sea
+icon_theme = Papirus-Dark-Maia
+wm_theme   = Matcha-dark-sea
+qt_style   = adwaita-dark
+
+[light]
+gtk_theme  = Matcha-light-sea
+icon_theme = Papirus-Light-Maia
+wm_theme   = Matcha-light-sea
+qt_style   = adwaita
+"""
+
+REQUIRED_BINARIES: dict[str, str] = {
+    "xfconf-query": "xfconf",
+    "gsettings":    "glib2 (Arch) / libglib2.0-bin (Debian/Ubuntu)",
+    "pkill":        "procps-ng (Arch) / procps (Debian/Ubuntu)",
+}
+
+GTK_THEME_DIRS: list[Path] = [
+    Path("/usr/share/themes"),
+    Path.home() / ".local/share/themes",
+    Path.home() / ".themes",
+]
+
+ICON_THEME_DIRS: list[Path] = [
+    Path("/usr/share/icons"),
+    Path.home() / ".local/share/icons",
+    Path.home() / ".icons",
+]
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class ConfigError(Exception):
+    pass
+
+
+class DependencyError(Exception):
+    pass
+
+
+class ThemeError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ThemeSet:
+    gtk_theme:  str
+    icon_theme: str
+    wm_theme:   str
+    qt_style:   str
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    lat:   float
+    lon:   float
+    dark:  ThemeSet
+    light: ThemeSet
+
+
+# ---------------------------------------------------------------------------
+# Error reporting
+# ---------------------------------------------------------------------------
+
+def die(message: str, hint: str = "") -> NoReturn:
+    print(f"ERROR: {message}", file=sys.stderr)
+    if hint:
+        print(f"  → {hint}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# State (manual override: auto / dark / light)
+# ---------------------------------------------------------------------------
+
+def read_state() -> str:
+    if not STATE_FILE.exists():
+        return "auto"
+    p = configparser.ConfigParser()
+    p.read(STATE_FILE)
+    mode = p.get("override", "mode", fallback="auto")
+    return mode if mode in ("auto", "dark", "light") else "auto"
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def _write_atomic(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(content)
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _create_default_config() -> NoReturn:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _write_atomic(CONFIG_FILE, DEFAULT_CONFIG)
+    print(f"Created default config: {CONFIG_FILE}")
+    print("Edit the file to set your coordinates and preferred themes, then re-run.")
+    sys.exit(0)
+
+
+def load_config() -> AppConfig:
+    if not CONFIG_FILE.exists():
+        print(f"No config found at {CONFIG_FILE}")
+        _create_default_config()
+
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#",))
+    parser.read(CONFIG_FILE)
+
+    errors: list[str] = []
+
+    def require(section: str, key: str) -> str:
+        if not parser.has_section(section):
+            msg = f"Missing section [{section}]"
+            if msg not in errors:
+                errors.append(msg)
+            return ""
+        if not parser.has_option(section, key):
+            errors.append(f"Missing key '{key}' in [{section}]")
+            return ""
+        return parser[section][key].strip()
+
+    lat_str  = require("location", "lat")
+    lon_str  = require("location", "lon")
+    dark_gtk = require("dark",     "gtk_theme")
+    dark_ico = require("dark",     "icon_theme")
+    dark_wm  = require("dark",     "wm_theme")
+    dark_qt  = require("dark",     "qt_style")
+    lite_gtk = require("light",    "gtk_theme")
+    lite_ico = require("light",    "icon_theme")
+    lite_wm  = require("light",    "wm_theme")
+    lite_qt  = require("light",    "qt_style")
+
+    if errors:
+        for e in errors:
+            print(f"  CONFIG ERROR: {e}", file=sys.stderr)
+        die(f"Config file has {len(errors)} error(s): {CONFIG_FILE}")
+
+    try:
+        lat = float(lat_str)
+    except ValueError:
+        die(f"Invalid latitude '{lat_str}' in [location] — must be a decimal number, e.g. 53.08")
+    try:
+        lon = float(lon_str)
+    except ValueError:
+        die(f"Invalid longitude '{lon_str}' in [location] — must be a decimal number, e.g. 8.80")
+
+    if not -90 <= lat <= 90:
+        die(f"Latitude {lat} out of range — must be between -90 and 90")
+    if not -180 <= lon <= 180:
+        die(f"Longitude {lon} out of range — must be between -180 and 180")
+
+    return AppConfig(
+        lat=lat,
+        lon=lon,
+        dark=ThemeSet(gtk_theme=dark_gtk, icon_theme=dark_ico,
+                      wm_theme=dark_wm,   qt_style=dark_qt),
+        light=ThemeSet(gtk_theme=lite_gtk, icon_theme=lite_ico,
+                       wm_theme=lite_wm,   qt_style=lite_qt),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dependency & theme checks
+# ---------------------------------------------------------------------------
+
+def check_dependencies() -> None:
+    missing = [
+        f"  '{cmd}' — install: {pkg}"
+        for cmd, pkg in REQUIRED_BINARIES.items()
+        if shutil.which(cmd) is None
+    ]
+    if missing:
+        raise DependencyError("Missing required commands:\n" + "\n".join(missing))
+
+
+def _theme_exists(name: str, search_dirs: list[Path]) -> bool:
+    return any((d / name).is_dir() for d in search_dirs)
+
+
+def check_themes(config: AppConfig) -> None:
+    errors: list[str] = []
+    gtk_paths  = ", ".join(str(d) for d in GTK_THEME_DIRS)
+    icon_paths = ", ".join(str(d) for d in ICON_THEME_DIRS)
+
+    for label, theme_set in (("dark", config.dark), ("light", config.light)):
+        if not _theme_exists(theme_set.gtk_theme, GTK_THEME_DIRS):
+            errors.append(
+                f"[{label}] gtk_theme '{theme_set.gtk_theme}' not found\n"
+                f"    Searched: {gtk_paths}"
+            )
+        if not _theme_exists(theme_set.wm_theme, GTK_THEME_DIRS):
+            errors.append(
+                f"[{label}] wm_theme '{theme_set.wm_theme}' not found\n"
+                f"    Searched: {gtk_paths}"
+            )
+        if not _theme_exists(theme_set.icon_theme, ICON_THEME_DIRS):
+            errors.append(
+                f"[{label}] icon_theme '{theme_set.icon_theme}' not found\n"
+                f"    Searched: {icon_paths}"
+            )
+
+    if errors:
+        for e in errors:
+            print(f"  THEME ERROR: {e}", file=sys.stderr)
+        raise ThemeError(
+            f"{len(errors)} theme(s) not installed — install them or update {CONFIG_FILE}\n"
+            "  → GTK themes: https://www.xfce-look.org/\n"
+            "  → Icon themes: https://www.gnome-look.org/"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sun position
+# ---------------------------------------------------------------------------
+
+def sun_times(lat: float, lon: float) -> tuple[Optional[datetime], Optional[datetime]]:
+    now = datetime.now()
+    tz_offset_h = now.astimezone().utcoffset().total_seconds() / 3600
+    n = now.timetuple().tm_yday
+    lng_hour = lon / 15
+    results: dict[str, datetime] = {}
+
+    for rising in (True, False):
+        t = n + ((6 if rising else 18) - lng_hour) / 24
+        M = (0.9856 * t) - 3.289
+        L = (M + 1.916 * sin(radians(M)) + 0.020 * sin(radians(2 * M)) + 282.634) % 360
+        RA = degrees(atan2(0.91764 * sin(radians(L)), cos(radians(L)))) % 360
+        Lq  = (L  // 90) * 90
+        RAq = (RA // 90) * 90
+        RA  = (RA + (Lq - RAq)) / 15
+        sin_dec = 0.39782 * sin(radians(L))
+        cos_dec = cos(asin(sin_dec))
+        cos_h = (
+            cos(radians(90.833)) - sin_dec * sin(radians(lat))
+        ) / (cos_dec * cos(radians(lat)))
+
+        if not -1.0 <= cos_h <= 1.0:
+            return None, None
+
+        H = (degrees(acos(cos_h)) if not rising else 360 - degrees(acos(cos_h))) / 15
+        T  = H + RA - 0.06571 * t - 6.622
+        UT = (T - lng_hour) % 24
+        local = (UT + tz_offset_h) % 24
+        h, m = int(local), int((local % 1) * 60)
+        key = "sunrise" if rising else "sunset"
+        results[key] = now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+    return results.get("sunrise"), results.get("sunset")
+
+
+# ---------------------------------------------------------------------------
+# Runtime environment
+# ---------------------------------------------------------------------------
+
+def build_env() -> dict[str, str]:
+    uid     = os.getuid()
+    display = os.environ.get("DISPLAY", ":0")
+    dbus    = os.environ.get(
+        "DBUS_SESSION_BUS_ADDRESS",
+        f"unix:path=/run/user/{uid}/bus",
+    )
+    return {**os.environ, "DISPLAY": display, "DBUS_SESSION_BUS_ADDRESS": dbus}
+
+
+# ---------------------------------------------------------------------------
+# Theme application
+# ---------------------------------------------------------------------------
+
+def _run(env: dict[str, str], *cmd: str) -> None:
+    subprocess.run(list(cmd), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _write_ini(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomic(path, content)
+
+
+def _update_qt_config(path: Path, style: str) -> None:
+    if not path.exists():
+        return
+    # Lambda prevents re.sub from interpreting backslashes in style as backreferences
+    updated = re.sub(r"(?m)^style\s*=.*$", lambda _: f"style={style}", path.read_text())
+    _write_atomic(path, updated)
+
+
+def _update_vscode(dark: bool) -> None:
+    settings_path = Path.home() / ".config" / "Code" / "User" / "settings.json"
+    if not settings_path.exists():
+        return
+    try:
+        data = json.loads(settings_path.read_text())
+        data["window.autoDetectColorScheme"] = True
+        data.setdefault("workbench.preferredDarkColorTheme",  "Default Dark Modern")
+        data.setdefault("workbench.preferredLightColorTheme", "Default Light Modern")
+        settings_path.write_text(json.dumps(data, indent=4))
+    except (json.JSONDecodeError, OSError):
+        pass  # VSCode settings are optional; never abort the theme switch for this
+
+
+def set_theme(theme_set: ThemeSet, dark: bool, env: dict[str, str]) -> None:
+    prefer_dark_int = "1" if dark else "0"
+    scheme          = "prefer-dark" if dark else "prefer-light"
+    panel_dark      = "true"        if dark else "false"
+
+    _run(env, "xfconf-query", "-c", "xsettings",   "-p", "/Net/ThemeName",                   "-s", theme_set.gtk_theme)
+    _run(env, "xfconf-query", "-c", "xsettings",   "-p", "/Net/IconThemeName",               "-s", theme_set.icon_theme)
+    _run(env, "xfconf-query", "-c", "xsettings",   "-p", "/Gtk/ApplicationPreferDarkTheme",  "-n", "-t", "bool", "-s", prefer_dark_int)
+    _run(env, "xfconf-query", "-c", "xfwm4",       "-p", "/general/theme",                   "-s", theme_set.wm_theme)
+    _run(env, "xfconf-query", "-c", "xfce4-panel", "-p", "/panels/dark-mode",                "-s", panel_dark)
+
+    _run(env, "gsettings", "set", "org.gnome.desktop.interface", "color-scheme", scheme)
+    _run(env, "gsettings", "set", "org.gnome.desktop.interface", "gtk-theme",    theme_set.gtk_theme)
+    _run(env, "gsettings", "set", "org.gnome.desktop.interface", "icon-theme",   theme_set.icon_theme)
+
+    gtk_ini = (
+        f"[Settings]\n"
+        f"gtk-theme-name={theme_set.gtk_theme}\n"
+        f"gtk-icon-theme-name={theme_set.icon_theme}\n"
+        f"gtk-application-prefer-dark-theme={prefer_dark_int}\n"
+    )
+    _write_ini(Path.home() / ".config" / "gtk-3.0" / "settings.ini", gtk_ini)
+    _write_ini(Path.home() / ".config" / "gtk-4.0" / "settings.ini", gtk_ini)
+
+    _update_qt_config(Path.home() / ".config" / "qt5ct" / "qt5ct.conf", theme_set.qt_style)
+    _update_qt_config(Path.home() / ".config" / "qt6ct" / "qt6ct.conf", theme_set.qt_style)
+
+    _update_vscode(dark)
+
+    # xfconf notifies xfsettingsd automatically via D-Bus — only start it if dead
+    if subprocess.run(["pgrep", "-x", "xfsettingsd"], capture_output=True).returncode != 0:
+        subprocess.Popen(["xfsettingsd"], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _run(env, "pkill", "Thunar")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="xfce-theme-switch",
+        description="Switch XFCE theme based on sun position.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  xfce-theme-switch                 # auto based on sun position\n"
+            "  xfce-theme-switch --force dark     # force dark mode\n"
+            "  xfce-theme-switch --force light    # force light mode\n"
+            "  xfce-theme-switch --status         # show current mode and sun times\n"
+            "  xfce-theme-switch --skip-checks    # skip dependency/theme validation\n"
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        choices=["dark", "light"],
+        metavar="MODE",
+        help="Force a specific mode (dark|light), ignoring sun position",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Print current mode, sunrise, and sunset, then exit",
+    )
+    parser.add_argument(
+        "--skip-checks",
+        action="store_true",
+        help="Skip dependency and theme existence checks (useful for repeated cron calls)",
+    )
+    return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args   = parse_args()
+    config = load_config()
+
+    if not args.skip_checks:
+        try:
+            check_dependencies()
+            check_themes(config)
+        except (DependencyError, ThemeError) as exc:
+            die(str(exc))
+
+    sunrise, sunset = sun_times(config.lat, config.lon)
+    now = datetime.now()
+
+    state = read_state()
+
+    if args.force:
+        dark = args.force == "dark"
+    elif state in ("dark", "light"):
+        dark = state == "dark"
+    elif sunrise and sunset:
+        dark = not (sunrise <= now < sunset)
+    else:
+        dark = not (6 <= now.hour < 20)
+
+    mode = "dark" if dark else "light"
+
+    if args.status:
+        print(f"Mode:     {mode}")
+        print(f"Override: {state}")
+        if sunrise and sunset:
+            print(f"Sunrise:  {sunrise.strftime('%H:%M')}")
+            print(f"Sunset:   {sunset.strftime('%H:%M')}")
+        else:
+            print("(sun calculation unavailable at this latitude — using 06:00–20:00 fallback)")
+        return
+
+    theme_set = config.dark if dark else config.light
+    set_theme(theme_set, dark, build_env())
+
+
+if __name__ == "__main__":
+    main()

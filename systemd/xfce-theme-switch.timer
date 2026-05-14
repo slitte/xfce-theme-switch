@@ -1,0 +1,9 @@
+[Unit]
+Description=Check XFCE theme every 10 minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
