@@ -1,6 +1,6 @@
 # Maintainer: slitte <slitte@users.noreply.github.com>
 pkgname=xfce-theme-switch
-pkgver=1.0.1
+pkgver=1.0.2
 pkgrel=1
 pkgdesc="Automatic dark/light theme switcher for XFCE based on sun position, with system tray"
 arch=('any')
@@ -21,7 +21,7 @@ optdepends=(
     'qt6ct: Qt6 theme support'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('72b9e228ee04e3a1837f4de3fc8a036742036c426161923ae3be8fffa08371bd')
+sha256sums=('SKIP')
 
 package() {
     cd "$srcdir/$pkgname-$pkgver"
@@ -36,8 +36,8 @@ package() {
     install -Dm644 systemd/xfce-theme-tray.service \
         "$pkgdir/usr/lib/systemd/user/xfce-theme-tray.service"
 
-    install -Dm644 LICENSE \
-        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 LICENSE.md \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
     install -Dm644 README.md \
         "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

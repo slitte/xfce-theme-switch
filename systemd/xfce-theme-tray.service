@@ -1,13 +1,13 @@
 [Unit]
 Description=XFCE Theme Switch — System Tray
-After=graphical-session.target
-PartOf=graphical-session.target
+After=dbus.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sleep 3
 ExecStart=/usr/bin/xfce-theme-tray
 Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target
